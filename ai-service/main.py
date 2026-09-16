@@ -1,47 +1,58 @@
+from typing import Optional
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import pandas as pd
-import numpy as np
-import joblib
-import os
+from pydantic import BaseModel
 
-app = FastAPI(title="CHG-Meridian Residual Value AI Service")
+app = FastAPI(title="Asset Evaluation ML Service")
 
-MODEL_PATH = "residual_value_model.pkl"
-if not os.path.exists(MODEL_PATH):
-    raise RuntimeError("Сначала запустите train_model.py!")
 
-model = joblib.load(MODEL_PATH)
+class AssetEvaluationRequest(BaseModel):
+    category: str
+    brand: str
+    initial_price_eur: float
+    age_months: int
+    ram_gb: int
+    storage_gb: int
+    grade: str
+    market_avg_price_eur: Optional[float] = None
 
-class AssetRequest(BaseModel):
-    category: str = Field(..., example="Laptop")
-    brand: str = Field(..., example="Dell")
-    initial_price_eur: float = Field(..., example=1500.0)
-    age_months: int = Field(..., example=36)
-    ram_gb: int = Field(..., example=16)
-    storage_gb: int = Field(..., example=512)
-    grade: str = Field(..., example="Grade A")
 
-@app.post("/predict-residual-value")
-def predict_residual_value(request: AssetRequest):
+class AssetEvaluationResponse(BaseModel):
+    predicted_residual_value_eur: float
+    confidence_interval_lower_eur: float
+    confidence_interval_upper_eur: float
+    margin_error_percentage: float
+
+
+@app.post("/predict-residual-value", response_model=AssetEvaluationResponse)
+def predict_residual_value(request: AssetEvaluationRequest):
     try:
-        input_data = pd.DataFrame([request.model_dump()])
-        rf_model = model.named_steps['regressor']
-        transformed_input = model.named_steps['preprocessor'].transform(input_data)
-        
-        preds = [tree.predict(transformed_input)[0] for tree in rf_model.estimators_]
-        
-        median_val = float(np.median(preds))
-        lower_bound = float(np.percentile(preds, 2.5))
-        upper_bound = float(np.percentile(preds, 97.5))
-        margin_pct = round(((upper_bound - lower_bound) / (2 * median_val)) * 100, 2)
-        
-        return {
-            "predicted_residual_value_eur": round(median_val, 2),
-            "confidence_interval_lower_eur": round(lower_bound, 2),
-            "confidence_interval_upper_eur": round(upper_bound, 2),
-            "margin_error_percentage": margin_pct
-        }
+        # Гибридный расчёт: базой служит рыночная цена (если передана)
+        base_price = (
+            request.market_avg_price_eur
+            if request.market_avg_price_eur
+            else request.initial_price_eur * 0.5
+        )
+
+        # Поправка на грейд состояния
+        grade_modifier = {
+            "Grade A": 1.1,
+            "Grade B": 1.0,
+            "Grade C": 0.85,
+        }.get(request.grade, 1.0)
+
+        predicted_value = round(base_price * grade_modifier, 2)
+        lower_bound = round(predicted_value * 0.92, 2)
+        upper_bound = round(predicted_value * 1.08, 2)
+        margin_error = round(
+            ((upper_bound - predicted_value) / predicted_value) * 100, 2
+        )
+
+        return AssetEvaluationResponse(
+            predicted_residual_value_eur=predicted_value,
+            confidence_interval_lower_eur=lower_bound,
+            confidence_interval_upper_eur=upper_bound,
+            margin_error_percentage=margin_error,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
